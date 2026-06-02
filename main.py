@@ -9,7 +9,7 @@ import winreg
 from urllib.parse import urlparse
 from pathlib import Path
 
-VERSION = "v2.1.0"
+VERSION = "v2.2.0"
 APP_NAME = "NintendoMusic"
 APP_TITLE = "Nintendo Music for Windows"
 ALLOWED_DOMAIN = "nintendo.com"
@@ -107,6 +107,10 @@ def build_strings(lang):
         "restart_hint": {
             "zh": "语言设置已保存，下次启动时生效。",
             "en": "Language setting saved. It will take effect on next launch.",
+        }[lang],
+        "already_running": {
+            "zh": "Nintendo Music 已经在运行中。\n\n是否关闭之前的实例并重新打开？",
+            "en": "Nintendo Music is already running.\n\nDo you want to close the previous instance and reopen?",
         }[lang],
     }
 
@@ -284,6 +288,7 @@ class App:
         self.should_exit = False
         self._form = None
         self._menu_refs = {}
+        self._mutex = None
 
     def on_loaded(self, window):
         window.evaluate_js(JS_BLOCK_NAV)
@@ -426,6 +431,7 @@ class App:
                 self.main_window.destroy()
             except Exception:
                 pass
+        release_mutex(self._mutex)
         os._exit(0)
 
     def start_tray(self):
@@ -554,11 +560,88 @@ class App:
             pass
 
 
+MUTEX_NAME = "Global\\NintendoMusicSingleInstance"
+ERROR_ALREADY_EXISTS = 183
+
+
+def create_mutex(name):
+    return ctypes.windll.kernel32.CreateMutexW(None, True, name)
+
+
+def release_mutex(handle):
+    if handle:
+        ctypes.windll.kernel32.ReleaseMutex(handle)
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def check_single_instance():
+    mutex = create_mutex(MUTEX_NAME)
+    last_error = ctypes.windll.kernel32.GetLastError()
+    if last_error == ERROR_ALREADY_EXISTS:
+        return False, mutex
+    return True, mutex
+
+
+def find_and_kill_existing_window():
+    import ctypes.wintypes
+
+    ENUM_WINDOWS_PROC = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.wintypes.LPARAM, ctypes.wintypes.LPARAM
+    )
+
+    target_title = APP_TITLE
+    found_pids = []
+
+    def enum_callback(hwnd, _):
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        if length > 0:
+            buf = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+            if buf.value == target_title:
+                pid = ctypes.wintypes.DWORD()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value != os.getpid():
+                    found_pids.append(pid.value)
+        return True
+
+    ctypes.windll.user32.EnumWindows(ENUM_WINDOWS_PROC(enum_callback), 0)
+
+    for pid in found_pids:
+        try:
+            handle = ctypes.windll.kernel32.OpenProcess(0x0001, False, pid)
+            if handle:
+                ctypes.windll.kernel32.TerminateProcess(handle, 0)
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
 def main():
     webview.settings['OPEN_EXTERNAL_LINKS_IN_BROWSER'] = False
     set_auto_start(config["auto_start"])
 
+    is_first, mutex = check_single_instance()
+    if not is_first:
+        result = ctypes.windll.user32.MessageBoxW(
+            0,
+            T["already_running"],
+            APP_TITLE,
+            0x04 | 0x20,
+        )
+        if result == 6:
+            find_and_kill_existing_window()
+            time.sleep(1)
+            release_mutex(mutex)
+            is_first, mutex = check_single_instance()
+            if not is_first:
+                release_mutex(mutex)
+                os._exit(0)
+        else:
+            release_mutex(mutex)
+            os._exit(0)
+
     app = App()
+    app._mutex = mutex
     icon_path = get_icon_path()
 
     app.main_window = webview.create_window(
